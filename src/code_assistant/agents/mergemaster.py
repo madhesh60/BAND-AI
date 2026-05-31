@@ -51,6 +51,24 @@ class MergemasterAgent(BaseAgent):
             pipeline = self.state_manager.get_pipeline(pipeline_id)
             task_description = pipeline.user_task if pipeline else "code changes"
 
+            # --- Git Repository Initialization Guard ---
+            # If the working directory is not a git repository, we auto-initialize one.
+            # This prevents the 'fatal: not a git repository' crash when running inside
+            # a fresh container or a directory that was never initialized.
+            git_dir = self.repo_path / ".git"
+            if not git_dir.exists():
+                logger.warning(f"[mergemaster] No .git directory found at {self.repo_path}. Auto-initializing git repo...")
+                await self._run_git("init")
+                await self._run_git("config", "user.email", "code-assistant@band.ai")
+                await self._run_git("config", "user.name", "Code Assistant")
+                # Stage everything present so we have an initial base commit to branch from
+                await self._run_git("add", ".")
+                code, _, stderr = await self._run_git(
+                    "commit", "-m", "chore: initial commit by Code Assistant"
+                )
+                if code != 0 and "nothing to commit" not in stderr.lower():
+                    logger.warning(f"[mergemaster] Initial commit failed: {stderr}")
+
             # Sanitize for branch name
             branch_name = self._create_branch_name(task_description)
 

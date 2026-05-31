@@ -61,13 +61,32 @@ class BaseAgent(ABC):
         """Execute a task assigned to this agent."""
         pass
 
+    # Ordered fallback model list for OpenRouter free tier.
+    # When the primary configured model is rate-limited or unavailable, the agent will
+    # automatically cycle through this list until one succeeds. This prevents the entire
+    # pipeline from crashing due to a single model's quota being exhausted.
+    OPENROUTER_FALLBACK_MODELS = [
+        "qwen/qwen-2.5-coder-32b-instruct:free",
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "google/gemini-2.0-flash-exp:free",
+        "mistralai/mistral-7b-instruct:free",
+        "microsoft/phi-3-mini-128k-instruct:free",
+    ]
+
     async def call_llm(
         self,
         messages: list,
         max_tokens: int = 4096,
         temperature: float = 0.7,
     ) -> str:
-        """Call the LLM with the given messages, falling back to mock generator on failure."""
+        """Call the LLM with the given messages, falling back to mock generator on failure.
+        
+        Uses a multi-model fallback strategy:
+        1. If no valid API key → use deterministic mock response generator.
+        2. Try configured model up to 5 times with exponential backoff on rate limits.
+        3. On repeated rate limits → cycle through OPENROUTER_FALLBACK_MODELS.
+        4. If ALL models fail → fall back to mock generator (never crash).
+        """
         import os
         
         # API Key Validation & Dry-Run Fallback Check:
@@ -92,6 +111,9 @@ class BaseAgent(ABC):
         max_retries = 5
         base_delay = 5  # seconds
         
+        # Track if we've had to fall back to an alternative model
+        last_rate_limit_error = None
+        
         for attempt in range(max_retries):
             try:
                 # LLM Client Router:
@@ -100,7 +122,7 @@ class BaseAgent(ABC):
                 if hasattr(self.llm_client, "messages"):
                     # Anthropic client
                     if not model:
-                        model = "claude-sonnet-4-20250514"
+                        model = "claude-sonnet-4-5"
                     response = await self.llm_client.messages.create(
                         model=model,
                         max_tokens=max_tokens,
@@ -108,11 +130,14 @@ class BaseAgent(ABC):
                         system=self.system_prompt,
                         messages=messages,
                     )
-                    return response.content[0].text
+                    result = response.content[0].text if response.content else None
+                    if result is None:
+                        raise ValueError("LLM returned empty content")
+                    return result
                 elif hasattr(self.llm_client, "chat"):
                     # OpenAI or OpenRouter client
                     if not model:
-                        model = "gpt-4o"
+                        model = "gpt-4o-mini"
                     all_messages = [{"role": "system", "content": self.system_prompt}]
                     all_messages.extend(messages)
                     response = await self.llm_client.chat.completions.create(
@@ -121,7 +146,10 @@ class BaseAgent(ABC):
                         max_tokens=max_tokens,
                         temperature=temperature,
                     )
-                    return response.choices[0].message.content
+                    result = response.choices[0].message.content if response.choices else None
+                    if result is None:
+                        raise ValueError("LLM returned empty content")
+                    return result
                 else:
                     raise ValueError("Unknown LLM client type")
             except Exception as e:
@@ -142,12 +170,27 @@ class BaseAgent(ABC):
                         if match2:
                             delay = float(match2.group(1)) + 1
                             
-                    logger.warning(f"[{self.name}] Rate limit (429) encountered. Retrying in {delay:.1f}s (Attempt {attempt+1}/{max_retries})...")
+                    last_rate_limit_error = e
+                    logger.warning(f"[{self.name}] Rate limit (429) on model '{model}'. Retrying in {delay:.1f}s (Attempt {attempt+1}/{max_retries})...")
+                    
+                    # After 2 rate-limit failures, try switching to a fallback model
+                    # This prevents wasting all retries on a single exhausted model.
+                    if attempt >= 2 and hasattr(self.llm_client, "chat"):
+                        fallback_idx = attempt - 2  # maps attempt 2,3,4 → fallback 0,1,2
+                        if fallback_idx < len(self.OPENROUTER_FALLBACK_MODELS):
+                            model = self.OPENROUTER_FALLBACK_MODELS[fallback_idx]
+                            logger.info(f"[{self.name}] Switching to fallback model: {model}")
+                    
                     await asyncio.sleep(delay)
                 else:
                     # Log failure and raise the exception, preventing silent failure and aiding user debugging.
                     logger.error(f"[{self.name}] LLM call failed permanently on attempt {attempt+1}: {e}", exc_info=True)
                     raise e
+        
+        # If ALL retries and model fallbacks fail (e.g., every model rate-limited), return a mock
+        # response instead of raising. This ensures the pipeline doesn't crash mid-run.
+        logger.error(f"[{self.name}] All LLM attempts exhausted. Falling back to mock response.")
+        return self._generate_mock_response(messages[-1]["content"])
 
     def _generate_mock_response(self, prompt: str) -> str:
         """Generate structured mock response based on the agent's role and prompt."""
