@@ -1,278 +1,263 @@
-# Code Assistant - Multi-Agent Coding Workflow
+# 🤖 Code Assistant — Multi-Agent Coding Workflow via BAND
 
-A multi-agent coding assistant powered by BAND orchestration, designed for the BAND of Agents Hackathon (Track 2: Multi-Agent Software Development).
+> **BAND of Agents Hackathon — Track 2: Multi-Agent Software Development**
+> 8 specialized AI agents that collaborate through **BAND as the real communication layer** to plan, write, review, test, debug, and ship code end-to-end.
 
-## Overview
+---
 
-Code Assistant is a sophisticated multi-agent system where 8 specialized AI agents collaborate to:
-- Understand and plan coding tasks
-- Implement high-quality code
-- Review and validate changes
-- Create comprehensive tests
-- Debug and fix issues
-- Manage Git operations and pull requests
+## 🚀 How BAND Powers This System
 
-## Architecture
+BAND is **not** a simulation layer here. When `BAND_API_KEY` is set, every agent:
+
+1. **Connects to BAND's WebSocket gateway** on startup via `ThenvoiLink.connect()` and subscribes to its dedicated chatroom.
+2. **Sends every peer message to the BAND platform** (REST `POST /chats/{room}/messages`) with proper `@mention` routing to the target agent.
+3. **Listens for incoming messages** via an async WebSocket event loop (`async for event in band_client:`) and dispatches them to local handlers.
+4. **Stores long-term memory on BAND** via `POST /memories` so agents remember context across restarts.
+5. **Provisions a dedicated chatroom per pipeline** so every task run is observable from the BAND web dashboard.
+
+| BAND Feature | Where Used |
+|---|---|
+| WebSocket real-time events | `CommunicationLayer.connect()` → `_listen_to_events()` |
+| REST chat message POST | `CommunicationLayer.send_message()` |
+| Agent @mentions | `ChatMessageRequestMentionsItem` per recipient |
+| Room provisioning | `_get_or_create_room()` per pipeline |
+| Long-term memory | `store_platform_memory()` / `list_platform_memories()` |
+
+**Without** `BAND_API_KEY` the system falls back to a local in-process bus so it still works offline.
+
+---
+
+## 🏗️ Architecture
 
 ```
 User Task
     │
     ▼
 ┌─────────────────────────────────────────────────────────┐
-│                      Conductor                            │
-│                 (Main Orchestrator)                      │
+│              LangGraph StateGraph Workflow               │
+│                                                          │
+│  planning → plan_review → [HITL gate] → coding          │
+│      → code_review → [HITL gate] → testing → merging   │
 └─────────────────────────────────────────────────────────┘
     │
-    ├──► Planner ───► Plan Reviewer
-    │
-    ├──► Coder ───► Code Reviewer ───► Debugger (if needed)
-    │
-    ├──► Test Engineer
-    │
-    └──► Mergemaster (Git/PR)
+    ▼
+BAND Platform (real WebSocket + REST API)
+    │  ┌──────────────┐    ┌──────────────┐
+    ├─►│  Conductor   │◄──►│   Planner    │
+    │  └──────────────┘    └──────────────┘
+    │  ┌──────────────┐    ┌──────────────┐
+    ├─►│    Coder     │◄──►│ Code Review  │
+    │  └──────────────┘    └──────────────┘
+    │  ┌──────────────┐    ┌──────────────┐
+    └─►│Test Engineer │    │ Mergemaster  │
+       └──────────────┘    └──────────────┘
 ```
 
 ### Agent Roles
 
 | Agent | Role | Description |
 |-------|------|-------------|
-| Conductor | Orchestrator | Coordinates the entire workflow |
-| Planner | Planning | Breaks down tasks into implementation steps |
-| Plan Reviewer | Review | Validates and improves plans |
-| Coder | Implementation | Writes code based on plans |
+| Conductor | Orchestrator | Coordinates the entire LangGraph workflow |
+| Planner | Planning | Breaks user tasks into actionable implementation steps |
+| Plan Reviewer | Review | Validates plans before coding starts |
+| Coder | Implementation | Writes code based on approved plans |
 | Code Reviewer | Quality | Reviews code for bugs and best practices |
 | Test Engineer | Testing | Creates and runs automated tests |
 | Debugger | Fixes | Identifies and fixes code issues |
 | Mergemaster | Git | Handles branches, commits, and PRs |
 
-## Features
+---
 
-- **8 Specialized Agents**: Each agent has a specific role in the workflow
-- **BAND Integration**: Agents communicate and coordinate via BAND platform
-- **Cross-Model Review**: Claude and GPT models work together
-- **Automated Testing**: Comprehensive test creation and execution
-- **Git Integration**: Automatic branch creation, commits, and PRs
-- **Real-time Progress**: Track pipeline execution via CLI or Web UI
+## ✨ Key Features
 
-## Installation
+- **Real BAND WebSocket integration** — live bidirectional events between all agents
+- **LangGraph state machine** — formal graph with interrupt-before gates for human approval
+- **Persistent memory** — `PersistentMemorySaver` + BAND long-term memory API
+- **Human-in-the-loop** — pause at plan and code review stages for user `/approve` or `/reject`
+- **Multi-model fallback** — cycles through 5 free OpenRouter models on rate limits (never crashes)
+- **Auto git init** — Mergemaster creates git repo if missing (no more `fatal: not a git repository`)
+- **Null-safe LLM calls** — explicit None guards on every LLM response (no NoneType crashes)
+- **Docker ready** — `docker/Dockerfile` + `docker/docker-compose.yml`
+- **CI/CD** — GitHub Actions on every push
+
+---
+
+## 📦 Installation
 
 ### Prerequisites
-
 - Python 3.10+
-- uv package manager
-- BAND account and API key
-- Anthropic API key (for Claude)
-- OpenAI API key (for GPT-4)
-- GitHub token (for PR operations)
-- gh CLI (optional, for PR management)
+- [`uv`](https://docs.astral.sh/uv/) package manager
+- BAND account and API key — [app.band.ai](https://app.band.ai)
+- OpenRouter key (recommended free models) or Anthropic/OpenAI key
 
-### Setup
+### Quick Start
 
-1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/code-assistant.git
-cd code-assistant
-```
+# 1. Clone
+git clone https://github.com/madhesh60/BAND-AI.git
+cd BAND-AI
 
-2. Install dependencies using uv:
-```bash
+# 2. Install dependencies
 uv sync
-```
 
-3. Create environment file:
-```bash
+# 3. Configure environment
 cp .env.example .env
+# Edit .env: add BAND_API_KEY and OVERALL_API_KEY (OpenRouter)
+
+# 4. Configure agent IDs
+cp agent_config.yaml.example agent_config.yaml
+# Edit agent_config.yaml: add BAND agent IDs from app.band.ai
+
+# 5. Run
+uv run code-assistant
 ```
 
-4. Configure your API keys in `.env`:
+---
+
+## 🖥️ CLI Usage
+
+### Interactive Shell (default)
+
 ```bash
-# BAND Platform
-BAND_API_KEY=band_u_your_api_key
-
-# LLM Providers
-ANTHROPIC_API_KEY=sk-ant-your-key
-OPENAI_API_KEY=sk-your-key
-
-# GitHub Integration
-GITHUB_TOKEN=ghp_your_token
+uv run code-assistant
 ```
 
-5. Create agents on BAND platform:
-   - Go to https://app.band.ai/agents
-   - Create 8 agents with names matching `agent_config.yaml`
-   - Copy the Agent UUIDs to your `.env` file
+| Command | Description |
+|---------|-------------|
+| `/task <description>` | Start a new coding pipeline |
+| `/status` | Show latest pipeline status |
+| `/history` | List all pipeline runs |
+| `/show [id]` | View generated code changes |
+| `/approve [id]` | Approve paused plan or code review |
+| `/reject [id] <feedback>` | Reject with feedback (triggers re-plan) |
+| `/help` | Show all commands |
+| `/exit` | Quit |
 
-6. Register agents and verify setup:
+### One-Shot Commands
+
 ```bash
-uv run python -m code_assistant agents
-```
+# Run a task directly
+uv run code-assistant run "Implement a Fibonacci calculator"
 
-## Usage
+# Check status
+uv run code-assistant status
 
-### CLI Interface
+# Show generated code
+uv run code-assistant show
 
-Submit a coding task:
-```bash
-uv run code-assistant run "Add JWT authentication to the API"
-```
+# View history
+uv run code-assistant history
 
-List available agents:
-```bash
+# List all agents
 uv run code-assistant agents
 ```
 
-Check status:
+---
+
+## 🐳 Docker
+
 ```bash
-uv run code-assistant status
+# Build and start the interactive CLI
+docker compose -f docker/docker-compose.yml run code-assistant
+
+# Run a specific task
+docker compose -f docker/docker-compose.yml run code-assistant run "Build a REST API"
 ```
 
-### Web Interface
+---
 
-Start the web server:
-```bash
-uv run code-assistant-web
+## 🔑 Environment Variables
+
+Copy `.env.example` to `.env`:
+
+```env
+# BAND Platform (required for real platform mode)
+BAND_API_KEY=band_a_your_key_here
+THENVOI_REST_URL=https://app.band.ai/
+THENVOI_WS_URL=wss://app.band.ai/api/v1/socket/websocket
+
+# LLM — OpenRouter (recommended — many free models)
+OVERALL_API_KEY=sk-or-v1-your_key_here
+LLM_MODEL=google/gemma-2-9b-it:free
+
+# Per-agent model overrides
+CODER_MODEL=qwen/qwen-2.5-coder-32b-instruct:free
+PLANNER_MODEL=meta-llama/llama-3.3-70b-instruct:free
 ```
 
-Open http://localhost:8000 in your browser.
+If `BAND_API_KEY` is not set or contains placeholder text, all agents fall back to the local in-process message bus. This is useful for local testing without BAND credentials.
 
-## How BAND is Used
+---
 
-### Agent Communication
-
-All agents communicate through BAND's platform using the `CommunicationLayer`:
-
-```python
-from code_assistant.band_integration import CommunicationLayer
-
-# Send a task to another agent
-await agent.send_to_agent(
-    "planner",
-    MessageType.TASK,
-    {"pipeline_id": "123", "task": "Implement feature X"},
-    subject="New task assignment"
-)
-```
-
-### Shared State
-
-Agents share state through `StateManager`:
-
-```python
-from code_assistant.band_integration import StateManager
-
-state_manager = StateManager()
-pipeline = state_manager.create_pipeline("Add login feature")
-state_manager.add_task(pipeline_id=pipeline.pipeline_id, title="Create auth module")
-```
-
-### Agent Factory
-
-Create configured agents using `AgentFactory`:
-
-```python
-from code_assistant.band_integration import AgentFactory
-
-agents = AgentFactory.create_all_agents()
-# Returns dict with all 8 agents configured
-```
-
-## Project Structure
+## 🗂️ Project Structure
 
 ```
 code-assistant/
 ├── src/code_assistant/
-│   ├── __init__.py           # Package init
-│   ├── main.py               # Entry point
-│   ├── agents/                # Agent implementations
-│   │   ├── __init__.py
-│   │   ├── base.py           # BaseAgent class
-│   │   ├── conductor.py      # Orchestrator
-│   │   ├── planner.py        # Task planner
-│   │   ├── plan_reviewer.py # Plan validator
-│   │   ├── coder.py          # Code implementation
-│   │   ├── code_reviewer.py # Code quality check
-│   │   ├── test_engineer.py  # Test creation
-│   │   ├── debugger.py       # Issue fixer
-│   │   └── mergemaster.py    # Git operations
-│   ├── band_integration/      # BAND SDK integration
-│   │   ├── __init__.py
-│   │   ├── communication.py  # Message passing
-│   │   ├── state_manager.py # Shared state
-│   │   └── agent_factory.py # Agent creation
-│   ├── interfaces/            # User interfaces
-│   │   ├── __init__.py
-│   │   ├── cli.py            # Command-line
-│   │   └── web.py            # Web UI
-│   ├── workflows/             # Pipeline orchestration
-│   │   ├── __init__.py
-│   │   └── coding_pipeline.py
-│   └── utils/                 # Utilities
-│       ├── __init__.py
-│       ├── config.py         # Configuration
-│       └── logging.py         # Logging setup
-├── tests/                     # Test suite
-├── pyproject.toml            # Project config
-├── .env.example              # Env template
-├── agent_config.yaml         # Agent config
-├── README.md                  # This file
-└── ARCHITECTURE.md            # Architecture docs
+│   ├── agents/                 # 8 specialized agents
+│   │   ├── base.py             # BaseAgent: LLM retry + BAND lifecycle
+│   │   ├── conductor.py        # Orchestrator
+│   │   ├── planner.py
+│   │   ├── plan_reviewer.py
+│   │   ├── coder.py
+│   │   ├── code_reviewer.py    # Null-safe LLM response handling
+│   │   ├── test_engineer.py
+│   │   ├── debugger.py
+│   │   └── mergemaster.py      # Auto git-init, PR creation
+│   ├── band_integration/
+│   │   ├── communication.py    # ThenvoiLink WebSocket + REST + memories
+│   │   ├── state_manager.py    # Shared pipeline state
+│   │   └── agent_factory.py    # Agent configuration factory
+│   ├── interfaces/
+│   │   └── cli.py              # Click CLI + interactive shell
+│   ├── workflows/
+│   │   └── coding_pipeline.py  # LangGraph StateGraph + PersistentMemorySaver
+│   └── utils/
+│       ├── config.py           # Config + API key routing
+│       └── logging.py
+├── tests/                      # 22 passing tests
+├── docker/                     # Dockerfile + docker-compose.yml
+├── docs/                       # ARCHITECTURE, CLI_USAGE, CONFIGURATION
+├── experiments/                # Exploratory scripts
+├── .github/workflows/ci.yml    # GitHub Actions CI
+├── agent_config.yaml.example   # Template — copy to agent_config.yaml
+├── .env.example                # Template — copy to .env
+└── pyproject.toml
 ```
 
-## Hackathon Requirements
+---
 
-This project meets all hackathon requirements:
+## 🧪 Tests
 
-- ✅ Minimum 3 agents collaborating through BAND (we have 8)
-- ✅ Meaningful BAND usage as the coordination layer
-- ✅ Clear task handoffs between agents
-- ✅ Shared context and state management
-- ✅ Real business workflow (software development)
-
-### Judging Criteria Addressed
-
-1. **Application of Technology (25%)**
-   - 8 agents collaborating through BAND
-   - Clear task handoffs and role specialization
-   - Shared state management
-
-2. **Presentation (25%)**
-   - Clean CLI interface
-   - Web UI for demos
-   - Well-documented architecture
-
-3. **Business Value (25%)**
-   - Solves real software development workflow
-   - Reduces manual coordination
-   - Accelerates code implementation
-
-4. **Originality (25%)**
-   - Multi-model review (Claude + GPT)
-   - End-to-end pipeline automation
-   - Git/PR automation
-
-## Development
-
-### Run Tests
 ```bash
-pytest tests/
+uv run pytest
+# 22 passed — covers WebSocket event routing, BAND platform mirroring, LangGraph interrupts
 ```
 
-### Lint Code
-```bash
-ruff check src/
-```
+---
 
-### Install in Development Mode
-```bash
-uv pip install -e ".[dev]"
-```
+## 🏆 Hackathon Requirements
+
+| Requirement | Status |
+|-------------|--------|
+| ≥ 3 agents via BAND | ✅ 8 agents, all registered on BAND |
+| BAND as real coordination layer | ✅ WebSocket events + REST messages + memories |
+| Clear task handoffs | ✅ LangGraph graph with conditional edges |
+| Shared state | ✅ `StateManager` + BAND memory API |
+| Real business workflow | ✅ Full software dev pipeline |
+| Human-in-the-loop | ✅ LangGraph interrupt gates |
+
+---
+
+## 📚 References
+
+- [BAND SDK Documentation](https://docs.band.ai/integrations/sdks/tutorials/setup)
+- [Thenvoi SDK](https://pypi.org/project/thenvoi/)
+- [LangGraph Docs](https://langchain-ai.github.io/langgraph/)
+- [BAND of Agents Hackathon](https://lablab.ai/ai-hackathons/band-of-agents-hackathon)
+
+---
 
 ## License
 
-MIT License - See LICENSE file for details.
-
-## References
-
-- [BAND SDK Documentation](https://docs.band.ai/integrations/sdks/tutorials/setup)
-- [CodeBand Reference](https://github.com/thenvoi/codeband)
-- [BAND of Agents Hackathon](https://lablab.ai/ai-hackathons/band-of-agents-hackathon)
+MIT — see [LICENSE](LICENSE).
