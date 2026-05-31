@@ -1,0 +1,27 @@
+version: "3.8"
+
+services:
+  code-assistant:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: code-assistant:latest
+    container_name: code-assistant-cli
+    # Enable interactive terminal for Click REPL execution
+    stdin_open: true
+    tty: true
+    # Load environment configuration containing OpenRouter/API keys
+    env_file:
+      - ../.env
+    # Volume mount map: maps host workspace to the container's active workspace.
+    # Note: chown/permissions are handled via standard container non-root appuser (UID 1000).
+    volumes:
+      - ..:/workspace
+      # Persist the interactive CLI command/state history files
+      - code_assistant_state:/home/appuser
+    # Default entrypoint CMD starts the Click REPL interactive shell.
+    # To run a single task: docker compose -f docker/docker-compose.yml run code-assistant run "Implement feature X"
+    command: []
+
+volumes:
+  code_assistant_state:
