@@ -15,6 +15,7 @@ dependencies = [
     "httpx>=0.26.0",
     "langgraph>=0.0.20",
     "langchain-openai>=0.0.5",
+    "thenvoi-sdk[anthropic]",
 ]
 
 [project.optional-dependencies]
@@ -42,3 +43,6 @@ testpaths = ["tests"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/code_assistant"]
+
+[tool.uv.sources]
+thenvoi-sdk = { git = "https://github.com/thenvoi/thenvoi-sdk-python.git" }

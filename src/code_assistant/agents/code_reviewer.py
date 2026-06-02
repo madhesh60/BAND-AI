@@ -29,7 +29,16 @@ class CodeReviewerAgent(BaseAgent):
         pipeline_id = task_data.get("pipeline_id", "")
         code_changes = task_data.get("code_changes", [])
 
-        logger.info(f"Reviewing {len(code_changes)} code changes")
+        # Always prefer the state_manager as the authoritative source of code changes.
+        # The LangGraph state["code_changes"] can be empty if the checkpoint didn't
+        # capture the coding node's return value correctly across a resume boundary.
+        if not code_changes and pipeline_id:
+            pipeline = self.state_manager.get_pipeline(pipeline_id)
+            if pipeline and pipeline.code_changes:
+                code_changes = pipeline.code_changes
+                logger.info(f"Loaded {len(code_changes)} code change(s) from state_manager (LangGraph state was empty)")
+
+        logger.info(f"Reviewing {len(code_changes)} code change(s)")
 
         all_issues = []
         all_suggestions = []

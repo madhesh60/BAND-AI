@@ -298,6 +298,7 @@ dependencies = [
     { name = "python-dotenv" },
     { name = "pyyaml" },
     { name = "rich" },
+    { name = "thenvoi-sdk", extra = ["anthropic"] },
 ]
 
 [package.optional-dependencies]
@@ -324,6 +325,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0.1" },
     { name = "rich", specifier = ">=13.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.2.0" },
+    { name = "thenvoi-sdk", extras = ["anthropic"], git = "https://github.com/thenvoi/thenvoi-sdk-python.git" },
 ]
 provides-extras = ["dev"]
 
@@ -1458,6 +1460,23 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/54/b8/077727592881e2bce52d9cd4198ddff4d2109eb30a456fe29bdd84eacba0/thenvoi_client_rest-0.0.7.tar.gz", hash = "sha256:1f793a96449556c304bbecce79db0ae2d8044e32b6c137e50c608d09cd97ddb3", size = 95101, upload-time = "2026-04-12T13:22:44.949Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/41/f4/61b5a86a1f3bbaeb09f46a01d019a2c0df0f6bf57494745ee670eee9e68b/thenvoi_client_rest-0.0.7-py3-none-any.whl", hash = "sha256:60b572ed3b64d2acaf447e50f36ea064506c14ca6c7d6ca9b3b197ccbc68c70f", size = 233953, upload-time = "2026-04-12T13:22:43.351Z" },
+]
+
+[[package]]
+name = "thenvoi-sdk"
+version = "0.2.11"
+source = { git = "https://github.com/thenvoi/thenvoi-sdk-python.git#e6b6245d117c28311863ffa8a5c6a5ed63dcfd1e" }
+dependencies = [
+    { name = "cryptography" },
+    { name = "phoenix-channels-python-client" },
+    { name = "python-dotenv" },
+    { name = "pyyaml" },
+    { name = "thenvoi-client-rest" },
+]
+
+[package.optional-dependencies]
+anthropic = [
+    { name = "anthropic" },
 ]
 
 [[package]]

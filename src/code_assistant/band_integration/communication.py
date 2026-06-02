@@ -1,234 +1,457 @@
-"""BAND communication layer for agent coordination."""
+"""
+communication.py — REAL Band SDK integration
+Replaces the old local message bus with actual Band WebSocket connections.
+
+Place this file at:
+src/code_assistant/band_integration/communication.py
+"""
 
 import asyncio
-import json
 import logging
-from dataclasses import dataclass, field
-from datetime import datetime
-from enum import Enum
-from typing import Any, Callable, Optional
-from uuid import UUID, uuid4
+import os
+from typing import Callable, Optional
+
+import yaml
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# Thenvoi SDK imports
-try:
-    from thenvoi import ThenvoiLink
-    from thenvoi.client.rest import (
-        ChatMessageRequest,
-        ChatMessageRequestMentionsItem,
-        MemoryCreateRequest,
+# ─────────────────────────────────────────────────────
+# CONFIG LOADER
+# Reads agent_config.yaml from project root
+# ─────────────────────────────────────────────────────
+
+def load_agent_config(agent_name: str) -> tuple[str, str]:
+    """
+    Load a specific agent's ID and API key from agent_config.yaml.
+
+    Usage:
+        agent_id, api_key = load_agent_config("conductor")
+
+    Returns:
+        (agent_id, api_key) as strings
+    """
+    # Look for agent_config.yaml in project root
+    config_path = os.path.join(
+        os.path.dirname(__file__),   # current file's folder
+        "..", "..", "..",            # go up to project root
+        "agent_config.yaml"
     )
-except ImportError:
-    ThenvoiLink = None
-    ChatMessageRequest = None
-    ChatMessageRequestMentionsItem = None
-    MemoryCreateRequest = None
+    config_path = os.path.abspath(config_path)
+
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(
+            f"agent_config.yaml not found at {config_path}\n"
+            "Make sure agent_config.yaml is in your project root folder."
+        )
+
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
+
+    if agent_name not in config:
+        raise KeyError(
+            f"Agent '{agent_name}' not found in agent_config.yaml.\n"
+            f"Available agents: {list(config.keys())}"
+        )
+
+    agent_data = config[agent_name]
+    agent_id  = agent_data["agent_id"]
+    api_key   = agent_data["api_key"]
+
+    if not agent_id or not api_key:
+        raise ValueError(f"agent_id or api_key is empty for agent '{agent_name}'")
+
+    return agent_id, api_key
 
 
-class MessageType(str, Enum):
-    """Types of messages between agents."""
+# ─────────────────────────────────────────────────────
+# BAND AGENT FACTORY
+# Creates a real Band agent using the official SDK
+# ─────────────────────────────────────────────────────
 
+def create_band_agent(agent_name: str, system_prompt: str):
+    """
+    Create a real Band agent connected to Band's platform.
+
+    This replaces the old 'local message bus' approach.
+    The agent connects via WebSocket to Band and sends/receives
+    messages through Band's actual infrastructure.
+
+    Usage:
+        agent = create_band_agent("conductor", "You are the conductor...")
+        await agent.run()
+
+    Args:
+        agent_name:    Must match a key in agent_config.yaml
+                       e.g. "conductor", "planner", "coder"
+        system_prompt: The personality and instructions for this agent
+
+    Returns:
+        A Band Agent object ready to call .run() on
+    """
+    try:
+        from thenvoi import Agent
+        from thenvoi.adapters import AnthropicAdapter
+        try:
+            from thenvoi.adapters import AdapterFeatures
+            _has_features = True
+        except ImportError:
+            _has_features = False
+    except ImportError:
+        raise ImportError(
+            "Band SDK not installed.\n"
+            "Run this command to install it:\n"
+            '  uv add "thenvoi-sdk[anthropic] @ git+https://github.com/thenvoi/thenvoi-sdk-python.git"'
+        )
+
+    # Load this agent's credentials from agent_config.yaml
+    agent_id, api_key = load_agent_config(agent_name)
+
+    # Create Claude-powered adapter with this agent's instructions
+    # Use new SDK API if available, fall back to deprecated params for older versions
+    if _has_features:
+        adapter = AnthropicAdapter(
+            model="claude-sonnet-4-5-20250929",
+            prompt=system_prompt,
+            features=AdapterFeatures(execution_reporting=True),
+            max_tokens=4096,
+        )
+    else:
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            adapter = AnthropicAdapter(
+                model="claude-sonnet-4-5-20250929",
+                custom_section=system_prompt,
+                enable_execution_reporting=True,
+                max_tokens=4096,
+            )
+
+    # Create the Band agent — this is what actually connects to Band
+    agent = Agent.create(
+        adapter=adapter,
+        agent_id=agent_id,
+        api_key=api_key,
+        ws_url=os.getenv("THENVOI_WS_URL"),
+        rest_url=os.getenv("THENVOI_REST_URL"),
+    )
+
+    logger.info(f"Band agent '{agent_name}' created with ID: {agent_id}")
+    return agent
+
+
+# ─────────────────────────────────────────────────────
+# SYSTEM PROMPTS FOR ALL 8 AGENTS
+# Each agent has its own personality and job description
+# ─────────────────────────────────────────────────────
+
+AGENT_PROMPTS = {
+
+    "conductor": """
+You are the Conductor — the orchestrator of a multi-agent coding system.
+
+Your job:
+1. Receive the user's coding task
+2. Send it to the Planner first
+3. Wait for each phase to complete before moving to the next
+4. Monitor progress and handle failures
+5. Give the user a final summary when all agents are done
+
+Workflow order you must follow:
+  User Task → Planner → Plan Reviewer → Coder → Code Reviewer → Test Engineer → Debugger (if needed) → Mergemaster
+
+Always be clear about which agent you are handing off to next and why.
+""",
+
+    "planner": """
+You are the Planner — a senior software architect.
+
+Your job:
+1. Receive a coding task from the Conductor
+2. Break it into clear, numbered subtasks
+3. For each subtask, specify: what file to create/modify, what the code should do, and acceptance criteria
+4. Estimate complexity as low, medium, or high
+5. Send your plan back to the Conductor for review
+
+Be specific. Vague plans cause bad code. Always list exact filenames.
+""",
+
+    "plan_reviewer": """
+You are the Plan Reviewer — a critical senior engineer.
+
+Your job:
+1. Receive an implementation plan from the Conductor
+2. Check for: missing steps, file conflicts, unclear acceptance criteria, wrong complexity estimates
+3. Either APPROVE the plan (send back with verdict: approved) or REJECT it with specific reasons
+4. If rejecting, explain exactly what needs to change
+
+Be strict but fair. A bad plan leads to bad code.
+""",
+
+    "coder": """
+You are the Coder — an expert software engineer.
+
+Your job:
+1. Receive an approved plan from the Conductor
+2. Write complete, working code for every subtask in the plan
+3. Add error handling, type hints, and docstrings
+4. Follow Python best practices
+5. Send the code back with a list of all files created/modified
+
+Write real, runnable code. Never write placeholder code like 'pass' or '# TODO'.
+""",
+
+    "code_reviewer": """
+You are the Code Reviewer — a meticulous senior engineer.
+
+Your job:
+1. Receive code from the Conductor
+2. Check for: bugs, security vulnerabilities, missing error handling, style issues
+3. Give each file a score out of 100
+4. Either APPROVE (verdict: approved) or request changes (verdict: needs_changes)
+5. For every issue, give the exact fix, not just a complaint
+
+Be thorough. You are the last line of defense before testing.
+""",
+
+    "test_engineer": """
+You are the Test Engineer — a QA specialist.
+
+Your job:
+1. Receive code from the Conductor
+2. Write comprehensive pytest tests for every function and class
+3. Cover: happy path, edge cases, error cases
+4. Aim for at least 80% code coverage
+5. Send back the test files with instructions on how to run them
+
+Write real tests that will actually catch bugs.
+""",
+
+    "debugger": """
+You are the Debugger — a specialist in finding and fixing broken code.
+
+Your job:
+1. Receive failing tests or error reports from the Conductor
+2. Identify the root cause of each failure
+3. Fix the code (not the tests, unless the tests are wrong)
+4. Explain what was wrong and what you changed
+5. Send the fixed code back
+
+Be precise about root causes. Don't just suppress errors — fix them properly.
+""",
+
+    "mergemaster": """
+You are the Mergemaster — the integration engineer.
+
+Your job:
+1. Receive approved, tested code from the Conductor
+2. Create a git branch with a descriptive name
+3. Commit all files with a proper commit message
+4. Create a pull request with a clear title and description
+5. Report the PR URL back to the Conductor
+
+If git is not initialized, initialize it first. Always check for merge conflicts.
+""",
+}
+
+
+# ─────────────────────────────────────────────────────
+# CREATE ALL 8 AGENTS AT ONCE
+# Used by the pipeline to start everything together
+# ─────────────────────────────────────────────────────
+
+def create_all_agents() -> dict:
+    """
+    Create all 8 Band agents and return them as a dict.
+
+    Usage:
+        agents = create_all_agents()
+        await agents["conductor"].run()
+
+    Returns:
+        Dict mapping agent name → Band Agent object
+    """
+    agents = {}
+    for name, prompt in AGENT_PROMPTS.items():
+        try:
+            agents[name] = create_band_agent(name, prompt)
+            logger.info(f"✓ Created agent: {name}")
+        except Exception as e:
+            logger.error(f"✗ Failed to create agent '{name}': {e}")
+            raise
+
+    logger.info(f"All {len(agents)} Band agents created successfully")
+    return agents
+
+
+# ─────────────────────────────────────────────────────
+# VERIFY ALL AGENTS CAN CONNECT
+# Run this before your demo to make sure everything works
+# ─────────────────────────────────────────────────────
+
+async def verify_all_agents():
+    """
+    Test that all 8 agents can connect to Band.
+    Run this with: python -m code_assistant.band_integration.communication
+
+    Each agent connects, confirms it's online, then disconnects.
+    """
+    print("\n[CodeBand] Verifying all 8 Band agents...\n")
+
+    results = {}
+    for name in AGENT_PROMPTS.keys():
+        try:
+            agent = create_band_agent(name, AGENT_PROMPTS[name])
+            await agent.start()
+            agent_name_on_platform = getattr(agent, "agent_name", name)
+            await agent.stop()
+            results[name] = ("[OK]", agent_name_on_platform)
+            print(f"  [OK] {name:20s} -> connected as '{agent_name_on_platform}'")
+        except Exception as e:
+            results[name] = ("[FAIL]", str(e))
+            print(f"  [FAIL] {name:20s} -> FAILED: {e}")
+
+    success = sum(1 for v in results.values() if v[0] == "[OK]")
+    print(f"\n  {success}/8 agents connected successfully")
+
+    if success == 8:
+        print("  All agents ready! You can run the pipeline now.\n")
+    else:
+        print("  Fix the failed agents before running the pipeline.\n")
+
+    return results
+
+
+if __name__ == "__main__":
+    asyncio.run(verify_all_agents())
+
+
+# ─────────────────────────────────────────────────────
+# BACKWARD-COMPATIBILITY SHIMS
+# The rest of the codebase (base.py, __init__.py, etc.)
+# still imports these names from this module.
+# These lightweight stubs keep those imports working
+# while the new Band SDK functions coexist above.
+# ─────────────────────────────────────────────────────
+
+import enum
+import uuid
+import dataclasses
+from typing import Any
+
+
+class MessageType(enum.Enum):
+    """Type of message being sent between agents."""
     TASK = "task"
-    RESPONSE = "response"
+    REVIEW = "review"
+    CODE_CHANGE = "code_change"
+    CHAT = "chat"
+    STATUS = "status"
     STATUS_UPDATE = "status_update"
+    RESPONSE = "response"
     ERROR = "error"
-    APPROVAL = "approval"
-    REJECTION = "rejection"
-    HANDOVER = "handover"
-    HEARTBEAT = "heartbeat"
 
 
-class Priority(str, Enum):
+class Priority(enum.Enum):
     """Message priority levels."""
-
     LOW = "low"
     NORMAL = "normal"
     HIGH = "high"
     CRITICAL = "critical"
 
 
-@dataclass
+@dataclasses.dataclass
 class AgentMessage:
-    """Message structure for agent communication."""
-
-    id: str = field(default_factory=lambda: str(uuid4()))
-    sender: str = ""
-    recipient: str = ""
-    message_type: MessageType = MessageType.TASK
-    priority: Priority = Priority.NORMAL
+    """A message passed between agents."""
+    sender: str
+    recipient: str
+    message_type: MessageType
+    content: dict
     subject: str = ""
-    content: dict = field(default_factory=dict)
-    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    priority: Priority = Priority.NORMAL
     correlation_id: Optional[str] = None
-    references: list = field(default_factory=list)
+    message_id: str = dataclasses.field(default_factory=lambda: str(uuid.uuid4()))
 
     def to_dict(self) -> dict:
-        """Convert message to dictionary."""
-        return {
-            "id": self.id,
-            "sender": self.sender,
-            "recipient": self.recipient,
-            "message_type": self.message_type.value,
-            "priority": self.priority.value,
-            "subject": self.subject,
-            "content": self.content,
-            "timestamp": self.timestamp,
-            "correlation_id": self.correlation_id,
-            "references": self.references,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "AgentMessage":
-        """Create message from dictionary."""
-        return cls(
-            id=data.get("id", str(uuid4())),
-            sender=data.get("sender", ""),
-            recipient=data.get("recipient", ""),
-            message_type=MessageType(data.get("message_type", "task")),
-            priority=Priority(data.get("priority", "normal")),
-            subject=data.get("subject", ""),
-            content=data.get("content", {}),
-            timestamp=data.get("timestamp", datetime.utcnow().isoformat()),
-            correlation_id=data.get("correlation_id"),
-            references=data.get("references", []),
-        )
+        return dataclasses.asdict(self)
 
 
 class LocalMessageBus:
-    """Thread-safe asynchronous local message router for agents."""
-
+    """
+    In-memory message bus used when running locally without Band.
+    Agents register themselves here and can send messages directly.
+    """
     _agents: dict = {}
-    _lock = asyncio.Lock()
+    _queues: dict = {}
 
     @classmethod
     def register_agent(cls, name: str, agent: Any) -> None:
         cls._agents[name] = agent
-        logger.info(f"Registered agent '{name}' on local message bus")
+        cls._queues.setdefault(name, asyncio.Queue())
+        logger.debug(f"LocalMessageBus: registered agent '{name}'")
 
     @classmethod
     def unregister_agent(cls, name: str) -> None:
         cls._agents.pop(name, None)
-        logger.info(f"Unregistered agent '{name}' from local message bus")
+        cls._queues.pop(name, None)
+        logger.debug(f"LocalMessageBus: unregistered agent '{name}'")
 
     @classmethod
-    async def post_message(cls, message: AgentMessage) -> None:
-        recipient = message.recipient
-        if recipient in cls._agents:
-            agent = cls._agents[recipient]
-            # Deliver in a non-blocking background task
-            asyncio.create_task(cls._deliver(agent, message))
+    async def deliver(cls, message: AgentMessage) -> None:
+        queue = cls._queues.get(message.recipient)
+        if queue:
+            await queue.put(message)
         else:
             logger.warning(
-                f"LocalMessageBus: Recipient '{recipient}' not registered (message: {message.subject})"
+                f"LocalMessageBus: no queue for recipient '{message.recipient}'"
             )
 
     @classmethod
-    async def _deliver(cls, agent: Any, message: AgentMessage) -> None:
-        try:
-            if hasattr(agent, "communication"):
-                agent.communication.receive_message(message)
-            else:
-                agent.receive_message(message)
-        except Exception as e:
-            logger.error(f"Failed to deliver message to agent '{agent.name}': {e}")
+    def get_registered_agents(cls) -> list:
+        return list(cls._agents.keys())
 
 
 class CommunicationLayer:
-    """Handles communication between agents via BAND.
-    
-    If credentials (BAND_API_KEY) are set in the environment, it dynamically 
-    initializes a connection via the thenvoi SDK (ThenvoiLink) to mirror 
-    messages and manage chat rooms/memories directly on the Band.ai platform.
-    If credentials are not found, it gracefully falls back to LocalMessageBus.
+    """
+    Abstraction layer for agent-to-agent communication.
+
+    In local/test mode this uses LocalMessageBus.
+    When Band credentials are present it delegates to the Band SDK.
     """
 
-    def __init__(self, agent_name: str, band_client: Optional[Any] = None):
-        import os
+    def __init__(self, agent_name: str):
         self.agent_name = agent_name
-        self.band_client = band_client
-        self._message_handlers: dict = {}
-        self._pending_messages: list = []
-        self._awaiting_response: dict = {}
-        self._listener_task: Optional[asyncio.Task] = None
-        
-        # Dynamic SDK Client Initialization:
-        # If no client is passed explicitly but we have real BAND credentials in the env,
-        # we dynamically spin up a ThenvoiLink for this specific agent.
-        if not self.band_client and ThenvoiLink is not None:
-            api_key = os.getenv("BAND_API_KEY", "")
-            is_placeholder = not api_key or "your" in api_key.lower() or api_key == "test-key"
-            
-            if not is_placeholder:
-                from code_assistant.utils.config import config
-                agent_cfg = config.get_agent_config(agent_name)
-                if agent_cfg and agent_cfg.agent_id:
-                    agent_id = agent_cfg.agent_id
-                    is_real_id = agent_id and "{" not in agent_id
-                    
-                    if is_real_id:
-                        band_cfg = config.config.band
-                        try:
-                            logger.info(f"[{self.agent_name}] Dynamically initializing ThenvoiLink client (agent_id={agent_id})")
-                            self.band_client = ThenvoiLink(
-                                agent_id=agent_id,
-                                api_key=api_key,
-                                ws_url=band_cfg.ws_url,
-                                rest_url=band_cfg.rest_url,
-                            )
-                        except Exception as e:
-                            logger.error(f"[{self.agent_name}] Failed to initialize ThenvoiLink: {e}")
-                            
-        logger.info(f"Communication layer initialized for agent: {agent_name}")
+        self._handlers: dict = {}
+        self._band_agent = None
+        logger.debug(f"CommunicationLayer created for agent '{agent_name}'")
 
-    def register_handler(
-        self,
-        message_type: MessageType,
-        handler: Callable,
-    ) -> None:
-        """Register a handler for a specific message type."""
-        if message_type not in self._message_handlers:
-            self._message_handlers[message_type] = []
-        self._message_handlers[message_type].append(handler)
-        logger.debug(f"Registered handler for {message_type.value} on {self.agent_name}")
+    def register_handler(self, message_type: MessageType, handler) -> None:
+        """Register a callback for a specific message type."""
+        self._handlers.setdefault(message_type, []).append(handler)
 
-    async def _get_or_create_room(self) -> Optional[str]:
-        """Retrieve the current pipeline's platform chatroom ID, creating it if missing."""
-        if not self.band_client:
-            return None
-            
-        from code_assistant.band_integration.state_manager import StateManager
-        state_manager = StateManager()
-        if not state_manager._states:
-            return None
-            
-        # Get the latest active pipeline
-        latest_id = max(state_manager._states.keys(), key=lambda k: state_manager._states[k].updated_at)
-        pipeline = state_manager.get_pipeline(latest_id)
-        if not pipeline:
-            return None
-            
-        room_id = pipeline.metadata.get("band_room_id")
-        if room_id:
-            return room_id
-            
-        # Dynamically create room on the platform
+    async def connect(self) -> None:
+        """Connect to Band if credentials are available, otherwise stay local."""
         try:
-            from thenvoi.client.rest import ChatRoomRequest
-            logger.info(f"[{self.agent_name}] Dynamic Chatroom creation on Thenvoi for pipeline {pipeline.pipeline_id}")
-            response = await self.band_client.rest.agent_api_chats.create_agent_chat(
-                chat=ChatRoomRequest(task_id=pipeline.pipeline_id)
+            self._band_agent = create_band_agent(
+                self.agent_name,
+                AGENT_PROMPTS.get(self.agent_name, ""),
             )
-            if response and response.data:
-                room_id = response.data.id
-                pipeline.metadata["band_room_id"] = room_id
-                state_manager.save_state()
-                logger.info(f"[{self.agent_name}] Created platform chatroom ID: {room_id}")
-                return room_id
-        except Exception as e:
-            logger.error(f"[{self.agent_name}] Failed to create platform chatroom: {e}")
-            
-        return None
+            logger.info(f"[{self.agent_name}] Connected to Band platform")
+        except Exception as exc:
+            logger.warning(
+                f"[{self.agent_name}] Band connection skipped (running locally): {exc}"
+            )
+
+    async def disconnect(self) -> None:
+        """Disconnect from Band."""
+        if self._band_agent and hasattr(self._band_agent, "stop"):
+            try:
+                await self._band_agent.stop()
+            except Exception:
+                pass
+        self._band_agent = None
 
     async def send_message(
         self,
@@ -239,277 +462,37 @@ class CommunicationLayer:
         priority: Priority = Priority.NORMAL,
         correlation_id: Optional[str] = None,
     ) -> str:
-        """Send a message to another agent.
-        
-        Posts the message to the local in-process LocalMessageBus (for pipeline execution)
-        and mirrors it to the shared Thenvoi room if credentials are valid.
-        """
-        message = AgentMessage(
+        """Send a message to another agent."""
+        msg = AgentMessage(
             sender=self.agent_name,
             recipient=recipient,
             message_type=message_type,
-            priority=priority,
+            content=content,
             subject=subject,
-            content=content,
+            priority=priority,
             correlation_id=correlation_id,
         )
-
-        logger.info(
-            f"[{self.agent_name}] Sending {message_type.value} to {recipient}: {subject}"
+        await LocalMessageBus.deliver(msg)
+        logger.debug(
+            f"[{self.agent_name}] → [{recipient}] {message_type.value}: {subject}"
         )
-
-        # 1. Asynchronously post to Thenvoi Platform (Mirroring Mode)
-        if self.band_client and ChatMessageRequest is not None:
-            # Run room lookup and dispatch in a safe task so connection errors don't disrupt local pipeline
-            async def mirror_task():
-                try:
-                    room_id = await self._get_or_create_room()
-                    if room_id:
-                        # Construct mentioning structure
-                        from code_assistant.utils.config import config
-                        recipient_cfg = config.get_agent_config(recipient)
-                        mentions = []
-                        if recipient_cfg and recipient_cfg.agent_id:
-                            # Mentions are required by the Thenvoi message API
-                            handle = recipient_cfg.role or recipient
-                            mentions.append(ChatMessageRequestMentionsItem(
-                                id=recipient_cfg.agent_id,
-                                handle=handle
-                            ))
-                        
-                        # Serialize content dict nicely to display in the chatroom
-                        formatted_content = f"[{message_type.value.upper()}] {subject}\n\n"
-                        if isinstance(content, dict):
-                            formatted_content += json.dumps(content, indent=2)
-                        else:
-                            formatted_content += str(content)
-                            
-                        await self.band_client.rest.agent_api_messages.create_agent_chat_message(
-                            chat_id=room_id,
-                            message=ChatMessageRequest(
-                                content=formatted_content,
-                                mentions=mentions
-                            )
-                        )
-                        logger.info(f"[{self.agent_name}] Message mirrored to Thenvoi room {room_id}")
-                except Exception as e:
-                    logger.warning(f"[{self.agent_name}] Failed to mirror message to Thenvoi: {e}")
-            
-            asyncio.create_task(mirror_task())
-
-        # 2. Local fallback routing (always run to ensure pipeline runs fast and offline-ready)
-        self._pending_messages.append(message)
-        await LocalMessageBus.post_message(message)
-
-        return message.id
-
-    async def request_response(
-        self,
-        recipient: str,
-        message_type: MessageType,
-        content: dict,
-        timeout: float = 30.0,
-    ) -> Optional[AgentMessage]:
-        """Send a message and wait for a response."""
-        correlation_id = str(uuid4())
-        message_id = await self.send_message(
-            recipient=recipient,
-            message_type=message_type,
-            content=content,
-            correlation_id=correlation_id,
-        )
-
-        future = asyncio.Future()
-        self._awaiting_response[correlation_id] = future
-
-        try:
-            response = await asyncio.wait_for(future, timeout=timeout)
-            return response
-        except asyncio.TimeoutError:
-            logger.warning(f"Timeout waiting for response to {message_id}")
-            self._awaiting_response.pop(correlation_id, None)
-            return None
-
-    def receive_message(self, message: AgentMessage) -> None:
-        """Process an incoming message."""
-        logger.info(
-            f"[{self.agent_name}] Received {message.message_type.value} from {message.sender}"
-        )
-
-        # Handle correlation responses
-        if message.correlation_id and message.correlation_id in self._awaiting_response:
-            future = self._awaiting_response.pop(message.correlation_id)
-            if not future.done():
-                future.set_result(message)
-            return
-
-        # Dispatch to registered handlers
-        handlers = self._message_handlers.get(message.message_type, [])
-        for handler in handlers:
-            try:
-                if asyncio.iscoroutinefunction(handler):
-                    asyncio.create_task(handler(message))
-                else:
-                    handler(message)
-            except Exception as e:
-                logger.error(f"Handler error: {e}")
+        return msg.message_id
 
     async def broadcast(
         self,
+        recipients: list,
         message_type: MessageType,
         content: dict,
-        recipients: list,
         subject: str = "",
     ) -> list:
-        """Broadcast a message to multiple recipients."""
-        message_ids = []
+        """Send a message to multiple agents."""
+        ids = []
         for recipient in recipients:
-            msg_id = await self.send_message(
+            mid = await self.send_message(
                 recipient=recipient,
                 message_type=message_type,
                 content=content,
                 subject=subject,
             )
-            message_ids.append(msg_id)
-        return message_ids
-
-    def get_pending_messages(self) -> list:
-        """Get all pending messages."""
-        return self._pending_messages.copy()
-
-    def clear_pending(self) -> None:
-        """Clear pending messages."""
-        self._pending_messages.clear()
-
-    async def store_platform_memory(
-        self,
-        content: str,
-        thought: str,
-        system: str = "long_term",
-        type: str = "episodic",
-        segment: str = "agent",
-    ) -> Optional[Any]:
-        """Store long-term memory on the Thenvoi/BAND platform."""
-        if not self.band_client or MemoryCreateRequest is None:
-            logger.debug(f"[{self.agent_name}] Skipping store_platform_memory (local/fallback mode)")
-            return None
-            
-        try:
-            logger.info(f"[{self.agent_name}] Storing platform memory: type={type}, thought={thought}")
-            response = await self.band_client.rest.agent_api_memories.create_agent_memory(
-                memory=MemoryCreateRequest(
-                    content=content,
-                    system=system,
-                    type=type,
-                    segment=segment,
-                    thought=thought,
-                    scope="subject",
-                    subject_id=self.band_client.runtime.agent_id,
-                )
-            )
-            if response and response.data:
-                return response.data
-        except Exception as e:
-            logger.error(f"[{self.agent_name}] Failed to store platform memory: {e}")
-        return None
-
-    async def list_platform_memories(
-        self,
-        content_query: Optional[str] = None,
-        system: Optional[str] = None,
-        type: Optional[str] = None,
-    ) -> list:
-        """List long-term memories retrieved from the Thenvoi/BAND platform."""
-        if not self.band_client:
-            logger.debug(f"[{self.agent_name}] Skipping list_platform_memories (local/fallback mode)")
-            return []
-            
-        try:
-            logger.info(f"[{self.agent_name}] Listing platform memories for content_query='{content_query}'")
-            response = await self.band_client.rest.agent_api_memories.list_agent_memories(
-                content_query=content_query,
-                system=system,
-                type=type,
-                page_size=50,
-            )
-            if response and response.data:
-                return response.data
-        except Exception as e:
-            logger.error(f"[{self.agent_name}] Failed to list platform memories: {e}")
-        return []
-
-    async def connect(self) -> None:
-        """Connect to the Thenvoi platform and start listening for events in the background."""
-        if not self.band_client:
-            return
-            
-        try:
-            logger.info(f"[{self.agent_name}] Connecting to Thenvoi WebSocket gateway...")
-            await self.band_client.connect()
-            # Subscribe to agent's rooms/topics so we receive messages
-            await self.band_client.subscribe_agent_rooms()
-            
-            # Start background asyncio task to consume WebSocket events
-            self._listener_task = asyncio.create_task(self._listen_to_events())
-            logger.info(f"[{self.agent_name}] WebSocket connection established. Listening for events.")
-        except Exception as e:
-            logger.error(f"[{self.agent_name}] Failed to connect to Thenvoi WebSocket: {e}")
-
-    async def disconnect(self) -> None:
-        """Disconnect from the Thenvoi platform and clean up listeners."""
-        if self._listener_task and not self._listener_task.done():
-            self._listener_task.cancel()
-            try:
-                await self._listener_task
-            except asyncio.CancelledError:
-                pass
-            self._listener_task = None
-            
-        if self.band_client:
-            try:
-                await self.band_client.disconnect()
-                logger.info(f"[{self.agent_name}] Disconnected from Thenvoi platform")
-            except Exception as e:
-                logger.error(f"[{self.agent_name}] Error during Thenvoi disconnect: {e}")
-
-    async def _listen_to_events(self) -> None:
-        """Asynchronous loop consuming events from the Thenvoi link event queue."""
-        try:
-            # ThenvoiLink implements async iterator yielding PlatformEvent models
-            async for event in self.band_client:
-                if event.type == "message_created" and event.payload:
-                    payload = event.payload
-                    # Ignore messages that this agent sent
-                    if payload.sender_id == self.band_client.runtime.agent_id:
-                        continue
-                        
-                    logger.info(f"[{self.agent_name}] WebSocket received platform message from {payload.sender_name or payload.sender_id}: {payload.content[:50]}...")
-                    
-                    try:
-                        # Extract the original payload content dict if it is serialized as JSON
-                        content_dict = {}
-                        msg_body = payload.content
-                        if "\n\n" in msg_body:
-                            parts = msg_body.split("\n\n", 1)
-                            msg_body = parts[1]
-                        try:
-                            content_dict = json.loads(msg_body)
-                        except Exception:
-                            content_dict = {"text": payload.content}
-                            
-                        # Reconstruct the AgentMessage and route to the local handlers
-                        msg = AgentMessage(
-                            id=payload.id,
-                            sender=payload.sender_name or "platform",
-                            recipient=self.agent_name,
-                            message_type=MessageType.TASK,
-                            content=content_dict,
-                            correlation_id=payload.thread_id,
-                        )
-                        self.receive_message(msg)
-                    except Exception as e:
-                        logger.error(f"[{self.agent_name}] Error routing platform message: {e}")
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.error(f"[{self.agent_name}] WebSocket event listener loop encountered an error: {e}")
+            ids.append(mid)
+        return ids

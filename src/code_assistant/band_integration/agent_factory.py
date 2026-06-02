@@ -1,9 +1,9 @@
 """Factory for creating and configuring BAND agents."""
 
 import logging
+import os
 from typing import Any, Optional
 
-from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
 
 from code_assistant.utils.config import AgentConfig, config
@@ -23,13 +23,35 @@ class AgentFactory:
         model: Optional[str] = None,
         api_key: Optional[str] = None,
     ) -> Any:
-        """Create an LLM client based on provider."""
+        """Create an LLM client based on provider.
+        
+        Priority:
+        1. If provider is openrouter/overall → use OpenRouter with OVERALL_API_KEY.
+        2. If provider is openai → use OpenAI.
+        3. If provider is anthropic but OVERALL_API_KEY is available → upgrade to OpenRouter
+           so we never create an Anthropic client without a valid Anthropic key.
+        4. Only create an Anthropic client when an actual Anthropic key (sk-ant-...) is present.
+        """
+        # Always prefer OpenRouter if we have an OVERALL_API_KEY and no real Anthropic key
+        overall_key = os.getenv("OVERALL_API_KEY", "").strip()
+        anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+        has_real_anthropic = bool(anthropic_key and "your" not in anthropic_key.lower() and "sk-ant" in anthropic_key)
+        has_overall = bool(overall_key and "your" not in overall_key.lower() and "sk-" in overall_key)
+
+        if provider == "anthropic" and not has_real_anthropic and has_overall:
+            # Upgrade: no real Anthropic key → use OpenRouter instead
+            logger.info("No valid ANTHROPIC_API_KEY found; routing agent to OpenRouter instead.")
+            provider = "openrouter"
+            api_key = overall_key
+
         if provider == "anthropic":
+            # Only reach here when a real Anthropic key was confirmed above
+            from anthropic import AsyncAnthropic
             return AsyncAnthropic(api_key=api_key)
         elif provider in ("openai", "openrouter", "overall"):
             if provider in ("openrouter", "overall"):
                 return AsyncOpenAI(
-                    api_key=api_key,
+                    api_key=api_key or overall_key,
                     base_url="https://openrouter.ai/api/v1",
                     default_headers={
                         "HTTP-Referer": "http://localhost",

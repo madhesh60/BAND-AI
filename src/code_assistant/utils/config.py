@@ -122,8 +122,14 @@ class ConfigManager:
                 with open(config_path) as f:
                     self._agent_config = yaml.safe_load(f) or {}
 
+        # Support both YAML layouts:
+        #   1. agents at root level: `conductor:\n  agent_id: ...`
+        #   2. agents under 'agents:' key: `agents:\n  conductor:\n    agent_id: ...`
         agents_config = self._agent_config.get("agents", {})
         agent_data = agents_config.get(agent_name)
+        if agent_data is None:
+            # Fall back to root-level lookup (current agent_config.yaml format)
+            agent_data = self._agent_config.get(agent_name)
 
         if agent_data is None:
             return None
@@ -133,8 +139,8 @@ class ConfigManager:
         api_key = os.getenv("BAND_API_KEY", "")
 
         provider = os.getenv("LLM_PROVIDER", "")
-        overall_key = os.getenv("OVERALL_API_KEY", "")
-        has_overall = overall_key and "your" not in overall_key.lower() and "sk-" in overall_key
+        overall_key = os.getenv("OVERALL_API_KEY", "").strip()
+        has_overall = bool(overall_key and "your" not in overall_key.lower() and "sk-" in overall_key)
 
         if not provider:
             if has_overall:

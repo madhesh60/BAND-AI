@@ -65,12 +65,16 @@ class BaseAgent(ABC):
     # When the primary configured model is rate-limited or unavailable, the agent will
     # automatically cycle through this list until one succeeds. This prevents the entire
     # pipeline from crashing due to a single model's quota being exhausted.
+    # NOTE: Verified working June 2026. Update if models go offline (404) or stay rate-limited.
     OPENROUTER_FALLBACK_MODELS = [
-        "qwen/qwen-2.5-coder-32b-instruct:free",
-        "meta-llama/llama-3.3-70b-instruct:free",
-        "google/gemini-2.0-flash-exp:free",
-        "mistralai/mistral-7b-instruct:free",
-        "microsoft/phi-3-mini-128k-instruct:free",
+        "google/gemma-4-31b-it:free",                     # Confirmed working - good coder
+        "nvidia/nemotron-3-super-120b-a12b:free",         # Confirmed working - large reasoning
+        "nousresearch/hermes-3-llama-3.1-405b:free",      # 405B fallback
+        "openai/gpt-oss-120b:free",                       # OpenAI OSS large
+        "openai/gpt-oss-20b:free",                        # OpenAI OSS small
+        "qwen/qwen3-coder:free",                          # Good coder (rate-limited at peak)
+        "meta-llama/llama-3.3-70b-instruct:free",         # Llama 70B (rate-limited at peak)
+        "meta-llama/llama-3.2-3b-instruct:free",          # Small/fast last resort
     ]
 
     async def call_llm(
@@ -79,48 +83,48 @@ class BaseAgent(ABC):
         max_tokens: int = 4096,
         temperature: float = 0.7,
     ) -> str:
-        """Call the LLM with the given messages, falling back to mock generator on failure.
-        
+        """Call the LLM with the given messages.
+
         Uses a multi-model fallback strategy:
-        1. If no valid API key → use deterministic mock response generator.
-        2. Try configured model up to 5 times with exponential backoff on rate limits.
-        3. On repeated rate limits → cycle through OPENROUTER_FALLBACK_MODELS.
-        4. If ALL models fail → fall back to mock generator (never crash).
+        1. Validate that a real API key is configured — raise immediately if not.
+        2. Try the configured model up to 5 times with exponential backoff on rate limits.
+        3. On repeated rate limits, cycle through OPENROUTER_FALLBACK_MODELS.
+        4. If ALL models fail, re-raise the last exception so the error surfaces to the user.
         """
         import os
-        
-        # API Key Validation & Dry-Run Fallback Check:
-        # Check if a valid API key is present in environment variables.
-        # If the key is absent or contains placeholder text, fall back to the Mock response generator.
+
+        # API Key Validation:
+        # Require a real key. If missing or placeholder, raise immediately so the user
+        # sees a clear error instead of getting silently wrong output.
         api_key = (
-            os.getenv("ANTHROPIC_API_KEY", "") 
-            or os.getenv("OPENAI_API_KEY", "") 
+            os.getenv("ANTHROPIC_API_KEY", "")
+            or os.getenv("OPENAI_API_KEY", "")
             or os.getenv("OVERALL_API_KEY", "")
         )
         is_placeholder = not api_key or "your" in api_key.lower() or api_key in ("test-key", "test")
-        
+
         if is_placeholder:
-            logger.info(f"[{self.name}] Using Mock LLM fallback because no valid API key is present")
-            return self._generate_mock_response(messages[-1]["content"])
+            raise RuntimeError(
+                f"[{self.name}] No valid API key found. "
+                "Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or OVERALL_API_KEY in your .env file."
+            )
 
         # LLM Call Retry Strategy:
-        # We try calling the provider up to 5 times. We use exponential backoff as a base delay
-        # but dynamically override it if the provider API (such as Venice/OpenRouter)
-        # provides a precise 'retry_after_seconds' or 'retry-after' in the error metadata.
+        # Try the primary model up to 5 times with exponential backoff.
+        # After the first rate-limit, cycle through OPENROUTER_FALLBACK_MODELS.
         model = self.model
         max_retries = 5
-        base_delay = 5  # seconds
-        
-        # Track if we've had to fall back to an alternative model
-        last_rate_limit_error = None
-        
+        base_delay = 10  # seconds
+
+        client_class = type(self.llm_client).__name__
+        is_anthropic = "Anthropic" in client_class
+        is_openai_compat = "OpenAI" in client_class
+
+        last_exception: Optional[Exception] = None
+
         for attempt in range(max_retries):
             try:
-                # LLM Client Router:
-                # 1. Anthropic: Supports the new messages API with a top-level 'system' prompt argument.
-                # 2. OpenAI / OpenRouter: Uses standard chat.completions API with a 'system' role message prepended.
-                if hasattr(self.llm_client, "messages"):
-                    # Anthropic client
+                if is_anthropic:
                     if not model:
                         model = "claude-sonnet-4-5"
                     response = await self.llm_client.messages.create(
@@ -134,8 +138,7 @@ class BaseAgent(ABC):
                     if result is None:
                         raise ValueError("LLM returned empty content")
                     return result
-                elif hasattr(self.llm_client, "chat"):
-                    # OpenAI or OpenRouter client
+                elif is_openai_compat:
                     if not model:
                         model = "gpt-4o-mini"
                     all_messages = [{"role": "system", "content": self.system_prompt}]
@@ -151,230 +154,55 @@ class BaseAgent(ABC):
                         raise ValueError("LLM returned empty content")
                     return result
                 else:
-                    raise ValueError("Unknown LLM client type")
+                    raise ValueError(f"Unknown LLM client type: {client_class}")
+
             except Exception as e:
+                last_exception = e
                 err_msg = str(e).lower()
-                is_rate_limit = "429" in err_msg or "rate limit" in err_msg or "too many requests" in err_msg or "rate_limited" in err_msg
-                
+                is_rate_limit = (
+                    "429" in err_msg
+                    or "rate limit" in err_msg
+                    or "too many requests" in err_msg
+                    or "rate_limited" in err_msg
+                    or "ratelimit" in err_msg
+                )
+
                 if is_rate_limit and attempt < max_retries - 1:
-                    import re
-                    # Base delay calculation: exponential backoff (5s, 10s, 20s, 40s)
+                    import re as _re
                     delay = base_delay * (2 ** attempt)
-                    
-                    # Parse Venice/OpenRouter-specific rate limit header patterns
-                    match = re.search(r"retry_after_seconds':\s*([0-9.]+)", err_msg)
+                    match = _re.search(r"retry_after_seconds':\s*([0-9.]+)", err_msg)
                     if match:
-                        delay = float(match.group(1)) + 1
+                        delay = float(match.group(1)) + 2
                     else:
-                        match2 = re.search(r"retry-after':\s*'([0-9.]+)'", err_msg)
+                        match2 = _re.search(r"retry-after':\s*'([0-9.]+)'", err_msg)
                         if match2:
-                            delay = float(match2.group(1)) + 1
-                            
-                    last_rate_limit_error = e
-                    logger.warning(f"[{self.name}] Rate limit (429) on model '{model}'. Retrying in {delay:.1f}s (Attempt {attempt+1}/{max_retries})...")
-                    
-                    # After 2 rate-limit failures, try switching to a fallback model
-                    # This prevents wasting all retries on a single exhausted model.
-                    if attempt >= 2 and hasattr(self.llm_client, "chat"):
-                        fallback_idx = attempt - 2  # maps attempt 2,3,4 → fallback 0,1,2
+                            delay = float(match2.group(1)) + 2
+
+                    logger.warning(
+                        f"[{self.name}] Rate limit (429) on model '{model}'. "
+                        f"Retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})…"
+                    )
+
+                    if attempt >= 1 and is_openai_compat:
+                        fallback_idx = attempt - 1
                         if fallback_idx < len(self.OPENROUTER_FALLBACK_MODELS):
-                            model = self.OPENROUTER_FALLBACK_MODELS[fallback_idx]
-                            logger.info(f"[{self.name}] Switching to fallback model: {model}")
-                    
+                            new_model = self.OPENROUTER_FALLBACK_MODELS[fallback_idx]
+                            if new_model != model:
+                                model = new_model
+                                logger.info(f"[{self.name}] Switching to fallback model: {model}")
+
                     await asyncio.sleep(delay)
                 else:
-                    # Log failure and raise the exception, preventing silent failure and aiding user debugging.
-                    logger.error(f"[{self.name}] LLM call failed permanently on attempt {attempt+1}: {e}", exc_info=True)
-                    raise e
-        
-        # If ALL retries and model fallbacks fail (e.g., every model rate-limited), return a mock
-        # response instead of raising. This ensures the pipeline doesn't crash mid-run.
-        logger.error(f"[{self.name}] All LLM attempts exhausted. Falling back to mock response.")
-        return self._generate_mock_response(messages[-1]["content"])
+                    logger.error(f"[{self.name}] LLM call failed on attempt {attempt + 1}: {e}")
+                    if not is_rate_limit:
+                        raise
+                    break
 
-    def _generate_mock_response(self, prompt: str) -> str:
-        """Generate structured mock response based on the agent's role and prompt."""
-        import json
-        
-        # Determine based on agent name/role
-        if self.name == "planner":
-            # Extract task from prompt if possible
-            task_match = re.search(r'Task:\s*(.*)', prompt, re.IGNORECASE)
-            task = task_match.group(1).strip() if task_match else "coding task"
-            
-            # Find any .py file names in the task description
-            file_matches = re.findall(r'\b[a-zA-Z0-9_-]+\.py\b', task)
-            file_path = file_matches[0] if file_matches else "app.py"
-            
-            return json.dumps({
-                "steps": [
-                    {
-                        "order": 1,
-                        "description": f"Initialize the repository and basic files for {task}",
-                        "files_affected": [file_path],
-                        "action": "create"
-                    },
-                    {
-                        "order": 2,
-                        "description": "Implement the core logic and main function",
-                        "files_affected": [file_path],
-                        "action": "modify"
-                    }
-                ],
-                "files": [
-                    {
-                        "path": file_path,
-                        "action": "create",
-                        "description": "Main application file"
-                    }
-                ],
-                "dependencies": [],
-                "risks": [],
-                "complexity": "low",
-                "estimated_steps": 2
-            }, indent=2)
-            
-        elif self.name == "plan_reviewer":
-            return json.dumps({
-                "status": "approved",
-                "issues": [],
-                "suggestions": ["Add more specific unit tests in the implementation phase"],
-                "missing_steps": [],
-                "final_complexity": "low",
-                "summary": "The plan looks complete, covers main requirements, and is highly feasible."
-            }, indent=2)
-            
-        elif self.name == "coder":
-            # Determine files affected or task
-            step_match = re.search(r'Step:\s*(.*)', prompt, re.IGNORECASE)
-            step_desc = step_match.group(1).strip() if step_match else "coding step"
-            
-            files_match = re.search(r'Files affected:\s*(.*)', prompt, re.IGNORECASE)
-            files_affected_str = files_match.group(1).strip() if files_match else "app.py"
-            
-            # Extract first .py file name or fallback
-            file_matches = re.findall(r'\b[a-zA-Z0-9_-]+\.py\b', files_affected_str)
-            file_path = file_matches[0] if file_matches else "app.py"
-            
-            # Fetch user task for broader keyword context
-            user_task = ""
-            if self.state_manager and self.state_manager._states:
-                try:
-                    active_pipeline = max(
-                        self.state_manager._states.values(),
-                        key=lambda s: s.updated_at
-                    )
-                    if active_pipeline:
-                        user_task = active_pipeline.user_task
-                except Exception:
-                    pass
-                    
-            combined_desc = (step_desc + " " + user_task).lower()
-            
-            # Generate code based on task keywords
-            if "fibonacci" in combined_desc or "fibo" in combined_desc:
-                code_content = """# Fibonacci calculation script
-def fibonacci(n):
-    if n <= 0:
-        return []
-    elif n == 1:
-        return [0]
-    sequence = [0, 1]
-    while len(sequence) < n:
-        sequence.append(sequence[-1] + sequence[-2])
-    return sequence
-
-def main():
-    n = 10
-    print(f"First {n} Fibonacci numbers: {fibonacci(n)}")
-    return True
-
-if __name__ == "__main__":
-    main()
-"""
-            elif "hello" in combined_desc or "world" in combined_desc:
-                code_content = """# Hello World application
-def main():
-    print("Hello, World!")
-    return True
-
-if __name__ == "__main__":
-    main()
-"""
-            elif "date" in combined_desc or "time" in combined_desc:
-                code_content = """# Date and time printing script
-from datetime import datetime
-
-def main():
-    print(f"Current Date and Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    return True
-
-if __name__ == "__main__":
-    main()
-"""
-            else:
-                code_content = f"""# Script generated for: {step_desc}
-def main():
-    print("Executing step: {step_desc}")
-    return True
-
-if __name__ == "__main__":
-    main()
-"""
-            return json.dumps({
-                "implementations": [
-                    {
-                        "file_path": file_path,
-                        "action": "create",
-                        "content": code_content,
-                        "explanation": f"Implemented core functionality: {step_desc}"
-                    }
-                ]
-            }, indent=2)
-            
-        elif self.name == "code_reviewer":
-            file_match = re.search(r'File:\s*(.*)', prompt, re.IGNORECASE)
-            file_path = file_match.group(1).strip() if file_match else "app.py"
-            return json.dumps({
-                "file": file_path,
-                "issues": [],
-                "overall": "approved",
-                "summary": "Code is clean, well-formatted, and conforms to standard PEP-8 style guidelines."
-            }, indent=2)
-            
-        elif self.name == "test_engineer":
-            file_match = re.search(r'Original file:\s*(.*)', prompt, re.IGNORECASE)
-            file_path = file_match.group(1).strip() if file_match else "app.py"
-            test_path = file_path.replace(".py", "_test.py") if file_path.endswith(".py") else f"test_{file_path}"
-            
-            import_name = file_path.replace(".py", "") if file_path.endswith(".py") else "app"
-            
-            test_content = f"""import pytest
-from {import_name} import main
-
-def test_main():
-    assert main() is True
-"""
-            return json.dumps({
-                "test_file": test_path,
-                "content": test_content,
-                "test_count": 1,
-                "coverage_estimate": "100%"
-            }, indent=2)
-            
-        elif self.name == "debugger":
-            file_match = re.search(r'File:\s*(.*)', prompt, re.IGNORECASE)
-            file_path = file_match.group(1).strip() if file_match else "app.py"
-            return json.dumps({
-                "file": file_path,
-                "original_issue": "None",
-                "fix_applied": "No changes needed",
-                "fixed_content": "",
-                "success": True
-            }, indent=2)
-            
-        else:
-            return "Mock response"
+        # All retries exhausted — surface the real error to the user.
+        raise RuntimeError(
+            f"[{self.name}] All LLM attempts exhausted after {max_retries} retries. "
+            f"Last error: {last_exception}"
+        ) from last_exception
 
     async def start(self) -> None:
         """Start the agent."""
